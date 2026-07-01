@@ -85,6 +85,12 @@
     border-bottom:1px solid var(--line);
     font-size:12.5px;
     z-index:5;
+    transform:translateY(0);
+    transition:transform .22s ease;
+  }
+  #bar.hidden{ transform:translateY(-100%); }
+  #barGrip{
+    position:fixed;top:0;left:0;right:0;height:14px;z-index:6;
   }
   #dot{
     width:8px;height:8px;border-radius:50%;
@@ -159,6 +165,7 @@
 <body>
 
 <div id="app">
+  <div id="barGrip"></div>
   <div id="bar">
     <div id="dot"></div>
     <div id="brand">Fouce&nbsp;Me</div>
@@ -204,11 +211,19 @@
 
   // ---------- url handling ----------
   function getTargetUrl(){
+    var params = new URLSearchParams(window.location.search);
+    var raw = params.get('url');
+    if(!raw) return null;
+
+    // Accept full URLs (https://example.com) and bare hosts
+    // (example.com or www.example.com) — bare hosts get https:// prepended.
+    var candidate = raw;
+    if(!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(candidate)){
+      candidate = 'https://' + candidate;
+    }
+
     try{
-      var params = new URLSearchParams(window.location.search);
-      var raw = params.get('url');
-      if(!raw) return null;
-      var u = new URL(raw);
+      var u = new URL(candidate);
       if(u.protocol !== 'http:' && u.protocol !== 'https:') return null;
       return u.href;
     }catch(e){
@@ -220,13 +235,75 @@
   if(targetUrl){
     targetEl.textContent = targetUrl;
     frame.src = targetUrl;
+    mirrorSiteIdentity(targetUrl);
   }else{
     targetEl.textContent = 'no url loaded';
-    veilMsg.textContent = 'Missing or invalid ?url= parameter. Example: fouce-me.html?url=https://example.com';
+    veilMsg.textContent = 'Missing or invalid ?url= parameter. Example: fouce-me.html?url=example.com or ?url=https://example.com';
     veil.classList.add('show');
   }
 
-  // ---------- the event bridge ----------
+  // ---------- identity mirroring (title + favicon) ----------
+  // A cross-origin iframe cannot be read by JS (browser sandboxing), so the
+  // only way to reflect the target's real <title>/favicon is to fetch its
+  // HTML separately and parse it out. Cross-origin fetch usually needs a
+  // CORS proxy since most sites don't send Access-Control-Allow-Origin.
+  //
+  // api.allorigins.win is a free public proxy used here for a working demo —
+  // it can rate-limit or go down. For anything beyond testing, replace
+  // PROXY_BASE with your own tiny Cloudflare Worker / serverless function
+  // that fetches server-side and returns the HTML — same idea, reliable.
+  var PROXY_BASE = 'https://api.allorigins.win/raw?url=';
+
+  function setFavicon(href){
+    var existing = document.querySelectorAll('link[rel~="icon"]');
+    for(var i=0;i<existing.length;i++) existing[i].parentNode.removeChild(existing[i]);
+    var link = document.createElement('link');
+    link.rel = 'icon';
+    link.href = href;
+    document.head.appendChild(link);
+  }
+
+  function mirrorSiteIdentity(url){
+    var host;
+    try{ host = new URL(url).host; }catch(e){ host = url; }
+
+    // Immediate fallback so the tab never sits on the "Fouce Me" identity —
+    // Google's favicon service works via plain <link>, no CORS issue.
+    document.title = host;
+    setFavicon('https://www.google.com/s2/favicons?sz=64&domain=' + encodeURIComponent(host));
+
+    fetch(PROXY_BASE + encodeURIComponent(url))
+      .then(function(res){
+        if(!res.ok) throw new Error('proxy fetch ' + res.status);
+        return res.text();
+      })
+      .then(function(html){
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+
+        var titleTag = doc.querySelector('title');
+        if(titleTag && titleTag.textContent.trim()){
+          document.title = titleTag.textContent.trim();
+        }
+
+        var iconLink = doc.querySelector('link[rel="icon"]') ||
+                        doc.querySelector('link[rel="shortcut icon"]') ||
+                        doc.querySelector('link[rel~="icon"]');
+        if(iconLink && iconLink.getAttribute('href')){
+          try{
+            var iconUrl = new URL(iconLink.getAttribute('href'), url).href;
+            setFavicon(iconUrl);
+          }catch(e){ /* keep the fallback favicon */ }
+        }
+
+        Bridge.send('identity_mirrored', document.title);
+      })
+      .catch(function(e){
+        // fallbacks already applied above — just log it
+        Bridge.send('identity_mirror_failed', String(e && e.message || e));
+      });
+  }
+
+
   // Every detection anywhere in this file funnels through Bridge.send().
   var Bridge = {
     send: function(type, detail){
@@ -285,6 +362,32 @@
     logBody.innerHTML = '<div class="empty">No events yet.</div>';
     countEl.textContent = '0 events';
   });
+
+  // ---------- bar auto-hide ----------
+  // Settles out of view shortly after load so the tab reads as the target
+  // site rather than as "Fouce Me". A thin invisible strip at the very top
+  // (#barGrip) brings it back on tap — it never fully disappears from the
+  // app, just out of the way.
+  var bar = document.getElementById('bar');
+  var barGrip = document.getElementById('barGrip');
+  var hideTimer = null;
+
+  function scheduleHide(){
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(function(){
+      if(!logOpen) bar.classList.add('hidden');
+    }, 3000);
+  }
+  function showBar(){
+    bar.classList.remove('hidden');
+    scheduleHide();
+  }
+  barGrip.addEventListener('click', showBar);
+  bar.addEventListener('click', function(e){
+    if(e.target === logBtn || e.target === clearBtn) return;
+    scheduleHide();
+  });
+  scheduleHide();
 
   // ============================================================
   // DETECTORS
