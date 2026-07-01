@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Fouce Me</title>
+
+<!--
+  ============================================================================
+  FOUCE ME — secure URL viewer + security event bridge
+  ============================================================================
+  WHAT THIS FILE ACTUALLY DOES:
+    Loads ?url=<target> in a fullscreen iframe and listens for browser-level
+    signals that *correlate with* screenshotting, recording, overlays, or
+    tampering attempts (app backgrounded, window blur, fullscreen exit,
+    resize/orientation change, right-click / select / copy / drag attempts,
+    PrintScreen key on desktop). Every signal is normalized into one event
+    stream and forwarded to Android via a JS interface.
+
+  WHAT THIS FILE CANNOT DO (and no web page can):
+    - Actually block the OS screenshot/screen-recording gesture.
+    - Actually block another app from drawing an overlay on top of it.
+    - See or control content inside a cross-origin iframe (browser sandboxing).
+    That enforcement has to happen natively:
+      * Screenshot/recording block  -> WebView window FLAG_SECURE
+      * Overlay-on-top detection    -> your existing WindowFocusHandler
+                                        (SYSTEM_ALERT_WINDOW / usage stats)
+    This page is the reporting + UI layer that ties those native detections
+    and its own browser-side detections into one event log.
+
+  ANDROID INTEGRATION (WebView / AI2 extension):
+    1) Enable JS:
+         webView.getSettings().setJavaScriptEnabled(true);
+    2) Register the bridge (name MUST be "AndroidBridge"):
+         webView.addJavascriptInterface(new Object() {
+             @JavascriptInterface
+             public void onSecurityEvent(String jsonPayload) {
+                 // { "type": "...", "detail": "...", "ts": 169... }
+                 // parse + fire your own @SimpleEvent from here
+             }
+         }, "AndroidBridge");
+    3) Actually enforce the screenshot block natively (do this regardless of
+       anything JS reports):
+         getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
+                               WindowManager.LayoutParams.FLAG_SECURE);
+    4) To push native detections (overlay found, FLAG_SECURE tripped, etc.)
+       into this page's own event log/UI, call from native:
+         webView.evaluateJavascript(
+             "receiveNativeSecurityEvent('overlay_detected','pkg:com.example.app')",
+             null);
+    5) Load with:
+         webView.loadUrl("file:///android_asset/fouce-me.html?url=" +
+                          Uri.encode("https://www.example.com"));
+  ============================================================================
+-->
+
+<style>
+  :root{
+    --bg:#0b0c0f;
+    --panel:#14161a;
+    --line:#242730;
+    --text:#e6e8ec;
+    --muted:#8a8f9a;
+    --ok:#3ddc84;
+    --warn:#ff7a45;
+    --accent:#5b8cff;
+    --mono:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0;padding:0;height:100%;width:100%;
+    background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    overflow:hidden;
+    user-select:none;-webkit-user-select:none;
+  }
+  #app{
+    display:flex;flex-direction:column;height:100%;width:100%;
+  }
+  #bar{
+    flex:0 0 auto;
+    display:flex;align-items:center;gap:10px;
+    padding:8px 12px;
+    background:var(--panel);
+    border-bottom:1px solid var(--line);
+    font-size:12.5px;
+    z-index:5;
+  }
+  #dot{
+    width:8px;height:8px;border-radius:50%;
+    background:var(--ok);
+    box-shadow:0 0 0 3px rgba(61,220,132,0.15);
+    flex:0 0 auto;
+  }
+  #dot.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(255,122,69,0.18);}
+  #brand{font-weight:600;letter-spacing:.2px;}
+  #target{
+    color:var(--muted);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    flex:1 1 auto;min-width:0;
+  }
+  #count{
+    color:var(--muted);
+    font-family:var(--mono);
+    flex:0 0 auto;
+  }
+  #logBtn{
+    flex:0 0 auto;
+    background:transparent;border:1px solid var(--line);color:var(--text);
+    border-radius:6px;padding:4px 9px;font-size:11.5px;cursor:pointer;
+  }
+  #logBtn:active{background:var(--line);}
+
+  #frameWrap{flex:1 1 auto;position:relative;min-height:0;}
+  iframe{
+    width:100%;height:100%;border:0;display:block;background:#000;
+  }
+  #veil{
+    position:absolute;inset:0;
+    display:none;
+    align-items:center;justify-content:center;
+    background:rgba(11,12,15,0.94);
+    color:var(--muted);
+    font-size:13px;text-align:center;padding:24px;
+  }
+  #veil.show{display:flex;}
+
+  #log{
+    position:fixed;left:0;right:0;bottom:0;
+    max-height:38%;
+    background:var(--panel);
+    border-top:1px solid var(--line);
+    transform:translateY(100%);
+    transition:transform .18s ease;
+    z-index:10;
+    display:flex;flex-direction:column;
+  }
+  #log.open{transform:translateY(0);}
+  #logHead{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:8px 12px;border-bottom:1px solid var(--line);
+    font-size:11.5px;color:var(--muted);
+  }
+  #clearBtn{
+    background:transparent;border:1px solid var(--line);color:var(--muted);
+    border-radius:6px;padding:3px 8px;font-size:11px;cursor:pointer;
+  }
+  #logBody{
+    overflow-y:auto;padding:6px 12px 10px;
+    font-family:var(--mono);font-size:11.5px;line-height:1.6;
+  }
+  .row{display:flex;gap:8px;border-bottom:1px dashed var(--line);padding:4px 0;}
+  .t{color:var(--muted);flex:0 0 62px;}
+  .k{color:var(--accent);flex:0 0 auto;}
+  .d{color:var(--text);opacity:.85;}
+  .empty{color:var(--muted);padding:10px 0;}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="bar">
+    <div id="dot"></div>
+    <div id="brand">Fouce&nbsp;Me</div>
+    <div id="target">no url loaded</div>
+    <div id="count">0 events</div>
+    <button id="logBtn" type="button">Log</button>
+  </div>
+
+  <div id="frameWrap">
+    <iframe id="frame" title="secure-frame"
+      sandbox="allow-scripts allow-forms allow-same-origin allow-popups"
+      referrerpolicy="no-referrer"></iframe>
+    <div id="veil"><div id="veilMsg">Missing or invalid ?url= parameter.</div></div>
+  </div>
+
+  <div id="log">
+    <div id="logHead">
+      <span>Security event log</span>
+      <button id="clearBtn" type="button">Clear</button>
+    </div>
+    <div id="logBody"><div class="empty">No events yet.</div></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---------- state ----------
+  var events = [];
+  var logOpen = false;
+
+  var dot      = document.getElementById('dot');
+  var targetEl = document.getElementById('target');
+  var countEl  = document.getElementById('count');
+  var logBtn   = document.getElementById('logBtn');
+  var clearBtn = document.getElementById('clearBtn');
+  var logPanel = document.getElementById('log');
+  var logBody  = document.getElementById('logBody');
+  var frame    = document.getElementById('frame');
+  var veil     = document.getElementById('veil');
+  var veilMsg  = document.getElementById('veilMsg');
+
+  // ---------- url handling ----------
+  function getTargetUrl(){
+    try{
+      var params = new URLSearchParams(window.location.search);
+      var raw = params.get('url');
+      if(!raw) return null;
+      var u = new URL(raw);
+      if(u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+      return u.href;
+    }catch(e){
+      return null;
+    }
+  }
+
+  var targetUrl = getTargetUrl();
+  if(targetUrl){
+    targetEl.textContent = targetUrl;
+    frame.src = targetUrl;
+  }else{
+    targetEl.textContent = 'no url loaded';
+    veilMsg.textContent = 'Missing or invalid ?url= parameter. Example: fouce-me.html?url=https://example.com';
+    veil.classList.add('show');
+  }
+
+  // ---------- the event bridge ----------
+  // Every detection anywhere in this file funnels through Bridge.send().
+  var Bridge = {
+    send: function(type, detail){
+      var payload = { type: type, detail: detail || null, ts: Date.now() };
+      events.unshift(payload);
+      if(events.length > 500) events.length = 500;
+      renderLogRow(payload);
+      countEl.textContent = events.length + ' event' + (events.length === 1 ? '' : 's');
+      flashDot();
+
+      // 1) plain DOM event, for any same-page JS listener
+      window.dispatchEvent(new CustomEvent('fouceme:event', { detail: payload }));
+
+      // 2) forward to native Android via the JS interface, if present
+      if(window.AndroidBridge && typeof window.AndroidBridge.onSecurityEvent === 'function'){
+        try{ window.AndroidBridge.onSecurityEvent(JSON.stringify(payload)); }catch(e){}
+      }
+    }
+  };
+
+  // Native -> web: Android calls this via evaluateJavascript() to report
+  // things only native code can see (FLAG_SECURE trip, overlay detected,
+  // MediaProjection/recording detected, root/tamper flags, etc.)
+  window.receiveNativeSecurityEvent = function(type, detail){
+    Bridge.send('native:' + type, detail);
+  };
+
+  function flashDot(){
+    dot.classList.add('warn');
+    clearTimeout(flashDot._t);
+    flashDot._t = setTimeout(function(){ dot.classList.remove('warn'); }, 450);
+  }
+
+  // ---------- log UI ----------
+  function renderLogRow(p){
+    if(logBody.querySelector('.empty')) logBody.innerHTML = '';
+    var row = document.createElement('div');
+    row.className = 'row';
+    var d = new Date(p.ts);
+    var time = String(d.getHours()).padStart(2,'0') + ':' +
+               String(d.getMinutes()).padStart(2,'0') + ':' +
+               String(d.getSeconds()).padStart(2,'0');
+    row.innerHTML =
+      '<span class="t">' + time + '</span>' +
+      '<span class="k">' + p.type + '</span>' +
+      '<span class="d">' + (p.detail ? p.detail : '') + '</span>';
+    logBody.insertBefore(row, logBody.firstChild);
+  }
+
+  logBtn.addEventListener('click', function(){
+    logOpen = !logOpen;
+    logPanel.classList.toggle('open', logOpen);
+  });
+  clearBtn.addEventListener('click', function(){
+    events = [];
+    logBody.innerHTML = '<div class="empty">No events yet.</div>';
+    countEl.textContent = '0 events';
+  });
+
+  // ============================================================
+  // DETECTORS
+  // Each one only reports a *signal*. None of these block anything
+  // at the OS level — see the notice at the top of this file.
+  // ============================================================
+
+  // App/tab backgrounded or restored (covers app-switcher, some
+  // screenshot flows on older Android, notification shade pulls)
+  document.addEventListener('visibilitychange', function(){
+    Bridge.send(document.hidden ? 'app_backgrounded' : 'app_foregrounded');
+  });
+
+  // Window lost/gained focus (covers split-screen, floating windows,
+  // picture-in-picture, another app drawing over this one)
+  window.addEventListener('blur', function(){ Bridge.send('window_blur'); });
+  window.addEventListener('focus', function(){ Bridge.send('window_focus'); });
+
+  // Fullscreen exited unexpectedly
+  document.addEventListener('fullscreenchange', function(){
+    Bridge.send(document.fullscreenElement ? 'fullscreen_entered' : 'fullscreen_exited');
+  });
+
+  // Resize / orientation change — can indicate split-screen or a
+  // floating/resizable window being introduced
+  var resizeTimer = null;
+  window.addEventListener('resize', function(){
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function(){
+      Bridge.send('viewport_resized', window.innerWidth + 'x' + window.innerHeight);
+    }, 250);
+  });
+  if(screen.orientation){
+    screen.orientation.addEventListener('change', function(){
+      Bridge.send('orientation_changed', screen.orientation.type);
+    });
+  }
+
+  // Right-click / long-press context menu attempt
+  document.addEventListener('contextmenu', function(e){
+    e.preventDefault();
+    Bridge.send('context_menu_blocked');
+  });
+
+  // Text selection attempt
+  document.addEventListener('selectstart', function(e){
+    e.preventDefault();
+    Bridge.send('selection_blocked');
+  });
+
+  // Copy attempt
+  document.addEventListener('copy', function(e){
+    e.preventDefault();
+    Bridge.send('copy_blocked');
+  });
+
+  // Drag-out attempt (e.g. dragging the iframe/image content elsewhere)
+  document.addEventListener('dragstart', function(e){
+    e.preventDefault();
+    Bridge.send('drag_blocked');
+  });
+
+  // Desktop PrintScreen key (Windows/Linux browsers only — the OS still
+  // takes the screenshot, JS just gets a courtesy keydown in some browsers)
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'PrintScreen'){
+      Bridge.send('printscreen_key_pressed');
+    }
+    // Common dev-tools shortcuts — again, a signal only, not a real block
+    if((e.key === 'F12') ||
+       ((e.ctrlKey || e.metaKey) && e.shiftKey && ['I','J','C'].indexOf(e.key) !== -1)){
+      Bridge.send('devtools_shortcut_attempt', e.key);
+    }
+  });
+
+  // Page about to unload / be navigated away from
+  window.addEventListener('beforeunload', function(){
+    Bridge.send('page_unloading');
+  });
+
+  Bridge.send('viewer_initialized', targetUrl || 'no-url');
+})();
+</script>
+</body>
+</html>
